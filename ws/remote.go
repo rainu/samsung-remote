@@ -10,15 +10,20 @@ import (
 	"github.com/gorilla/websocket"
 	"net/http"
 	"strings"
+	"sync"
 	"time"
 )
 
 type samsungRemote struct {
-	applicationUrl    string
-	channelUrl        string
-	b64Name           string
-	wsDialer          *websocket.Dialer
+	applicationUrl string
+	channelUrl     string
+	b64Name        string
+	wsDialer       *websocket.Dialer
+
+	conlock           sync.RWMutex
 	channelConnection *websocket.Conn
+	conContext        context.Context
+	conContextCancel  context.CancelFunc
 }
 
 type SamsungRemoteConfig struct {
@@ -54,15 +59,19 @@ type ApplicationStatus struct {
 	IsVisible bool   `json:"visible"`
 }
 
+type ConnectionLostHandler func(error)
+
 type SamsungRemote interface {
 	//Establish a new connection to samsung tv.
 	//It will return the token which should be stored and reused for future usages.
-	Connect() (string, error)
+	//The given conLost-Handler will call when connection was lost.
+	Connect(conLost ConnectionLostHandler) (string, error)
 
 	//Establish a new connection to samsung tv.
 	//It will return the token which should be stored and reused for future usages.
+	//The given conLost-Handler will call when connection was lost.
 	//Cancels the action if the passed context is closed.
-	ConnectWithContext(ctx context.Context) (string, error)
+	ConnectWithContext(conLost ConnectionLostHandler, ctx context.Context) (string, error)
 
 	//Send a remote key.
 	SendKey(key string) error
@@ -144,11 +153,11 @@ func NewRemote(conf SamsungRemoteConfig) SamsungRemote {
 	}
 }
 
-func (s *samsungRemote) Connect() (string, error) {
-	return s.ConnectWithContext(context.Background())
+func (s *samsungRemote) Connect(conLost ConnectionLostHandler) (string, error) {
+	return s.ConnectWithContext(conLost, context.Background())
 }
 
-func (s *samsungRemote) ConnectWithContext(ctx context.Context) (string, error) {
+func (s *samsungRemote) ConnectWithContext(conLost ConnectionLostHandler, ctx context.Context) (string, error) {
 	connection, _, err := s.wsDialer.DialContext(ctx, s.channelUrl, nil)
 	if err != nil {
 		return "", fmt.Errorf("error while connecting: %w", err)
@@ -182,12 +191,41 @@ func (s *samsungRemote) ConnectWithContext(ctx context.Context) (string, error) 
 	if receivedToken != "" {
 		//ensure the token is applied in internal channel-url
 		if !strings.Contains(s.channelUrl, receivedToken) {
-			//lazy but it works: append the right token (it does not matter if a token is already present in url)
+			//lazy but it works: append the right token (it does not matter if a token is alre//The given conLost-Handler will call when connection was lost.ady present in url)
 			s.channelUrl += fmt.Sprintf(`&token=%s`, receivedToken)
 		}
 	}
 
+	s.startConnectionWatcher(conLost)
 	return receivedToken, nil
+}
+
+func (s *samsungRemote) startConnectionWatcher(conLost ConnectionLostHandler) {
+	s.conContext, s.conContextCancel = context.WithCancel(context.Background())
+
+	sendPing := func() error {
+		s.conlock.Lock()
+		defer s.conlock.Unlock()
+
+		return s.channelConnection.WriteMessage(websocket.PingMessage, []byte(`ping`))
+	}
+
+	go func() {
+		ticker := time.NewTicker(1 * time.Second)
+		for {
+			select {
+			case <-ticker.C:
+				if err := sendPing(); err != nil {
+					if conLost != nil {
+						conLost(err) //call the connection lost handler
+					}
+					return
+				}
+			case <-s.conContext.Done():
+				return
+			}
+		}
+	}()
 }
 
 func (s *samsungRemote) SendKey(key string) error {
@@ -300,6 +338,8 @@ func (s *samsungRemote) CloseAppWithContext(appId string, ctx context.Context) e
 }
 
 func (s *samsungRemote) Close() error {
+	s.conContextCancel() //cancel the connection watcher
+
 	return s.channelConnection.Close()
 }
 
@@ -338,6 +378,9 @@ func (s *samsungRemote) executeSingleCommand(url string, message string, ctx con
 }
 
 func (s *samsungRemote) sendChannelMessage(message string) error {
+	s.conlock.Lock()
+	defer s.conlock.Unlock()
+
 	return sendMessage(s.channelConnection, message)
 }
 

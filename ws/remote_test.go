@@ -16,7 +16,7 @@ func TestRemote(t *testing.T) {
 	})
 
 	ctx, _ := context.WithTimeout(context.Background(), 10*time.Second)
-	token, err := remote.ConnectWithContext(ctx)
+	token, err := remote.ConnectWithContext(nil, ctx)
 	assert.NoError(t, err)
 
 	fmt.Printf("%s\n", token)

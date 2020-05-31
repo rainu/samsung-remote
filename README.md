@@ -22,7 +22,7 @@ func main() {
 	})
 	defer remote.Close()
 
-	token, err := remote.Connect()
+	token, err := remote.Connect(nil)
 	if err != nil {
 		panic(err)
  	}
